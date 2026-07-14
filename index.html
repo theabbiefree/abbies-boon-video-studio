@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>abbies® Boon Video Studio v5</title>
+<title>abbies® Boon Video Studio v6</title>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:'Courier New',monospace;background:#f5e6c8;color:#111;height:100vh;overflow:hidden;user-select:none;}
@@ -68,7 +68,7 @@ input[type=color]{width:100%;height:24px;border:2px solid #d4651a;border-radius:
 <div class="hdr">
   <div class="ht">
     <h1>abbies® Boon Video Studio</h1>
-    <p>v5 · Preview · Export · 9:16 · 24fps</p>
+    <p>v6 · Preview · Export · 9:16 · 24fps · GIF BG</p>
   </div>
   <div class="hsp"></div>
 </div>
@@ -100,13 +100,14 @@ input[type=color]{width:100%;height:24px;border:2px solid #d4651a;border-radius:
         <input type="color" id="bgColor" value="#080808" oninput="bgColorVal=this.value;drawIdle();">
       </div>
       <div class="drop-zone sm-drop" id="dzBg">
-        <div class="dt" id="dzBgLabel">Drop image for background</div>
+        <div class="dt" id="dzBgLabel">Drop image or GIF for background</div>
       </div>
       <div class="tog-row" id="bgTogRow" style="display:none;">
         <div class="tog on" id="togStretch" onclick="setBgMode('stretch')">Stretch</div>
         <div class="tog" id="togTile" onclick="setBgMode('tile')">Tile</div>
         <div class="tog" id="togColor" onclick="setBgMode('color')">Color only</div>
       </div>
+      <div style="font-size:6px;color:#999;letter-spacing:.03em;line-height:1.5;margin-bottom:2px;" id="dzBgHint"></div>
 
       <span class="sec">Music</span>
       <div class="drop-zone sm-drop" id="dzMusic">
@@ -198,12 +199,84 @@ var bgColorVal = '#080808';
 var bgImg      = null;
 var bgMode     = 'color'; // 'color' | 'stretch' | 'tile'
 
+// Animated GIF background (decoded to frames so it can be sampled at any
+// simulation time — needed so it stays in sync during frame-by-frame export,
+// not just real-time preview).
+var bgIsAnimatedGif   = false;
+var bgGifFrames       = null;  // [{canvas, delay(ms)}, ...]
+var bgGifTotalDuration= 0;     // ms, sum of all frame delays
+var idleGifRaf        = null;
+var idleGifStart      = null;
+
 function setBgMode(m){
   bgMode = m;
   ['stretch','tile','color'].forEach(function(k){
     document.getElementById('tog'+k.charAt(0).toUpperCase()+k.slice(1)).classList.toggle('on', k===m);
   });
   drawIdle();
+  if(bgIsAnimatedGif && m!=='color') startIdleGifLoop();
+}
+
+// Decode an animated GIF into individual frames + per-frame delay using the
+// browser's native ImageDecoder (WebCodecs). Falls back gracefully (returns
+// false) on browsers that don't support it — the GIF still loads, just as a
+// static first-frame image.
+async function loadGifBackground(file){
+  bgIsAnimatedGif=false;bgGifFrames=null;bgGifTotalDuration=0;
+  if(!('ImageDecoder' in window)) return false;
+  try{
+    var buf=await file.arrayBuffer();
+    var decoder=new ImageDecoder({data:buf,type:'image/gif'});
+    await decoder.tracks.ready;
+    var track=decoder.tracks.selectedTrack;
+    var frameCount=track?track.frameCount:0;
+    if(!frameCount||frameCount<=1){try{decoder.close();}catch(e){}return false;}
+    var frames=[],total=0;
+    for(var i=0;i<frameCount;i++){
+      var res=await decoder.decode({frameIndex:i});
+      var vf=res.image;
+      var cv=document.createElement('canvas');
+      cv.width=vf.displayWidth;cv.height=vf.displayHeight;
+      cv.getContext('2d').drawImage(vf,0,0);
+      var delay=Math.max(20,(vf.duration||100000)/1000); // us -> ms
+      vf.close();
+      frames.push({canvas:cv,delay:delay});
+      total+=delay;
+    }
+    try{decoder.close();}catch(e){}
+    bgGifFrames=frames;bgGifTotalDuration=total;bgIsAnimatedGif=true;
+    return true;
+  }catch(e){
+    console.warn('GIF decode failed, using static frame instead',e);
+    return false;
+  }
+}
+
+// Returns the image/canvas to draw for the background at time t (seconds).
+function getCurrentBgImage(t){
+  if(bgIsAnimatedGif&&bgGifFrames&&bgGifFrames.length){
+    var ms=((t||0)*1000)%bgGifTotalDuration;
+    var acc=0;
+    for(var i=0;i<bgGifFrames.length;i++){
+      acc+=bgGifFrames[i].delay;
+      if(ms<acc)return bgGifFrames[i].canvas;
+    }
+    return bgGifFrames[bgGifFrames.length-1].canvas;
+  }
+  return bgImg;
+}
+
+// Keeps the background GIF animating in the idle canvas (before Preview is
+// hit) so it's obvious the animation loaded correctly.
+function startIdleGifLoop(){
+  if(idleGifRaf)return;
+  idleGifStart=performance.now();
+  (function step(){
+    if(!bgIsAnimatedGif||isPreviewing||isExporting||bgMode==='color'){idleGifRaf=null;return;}
+    var t=(performance.now()-idleGifStart)/1000;
+    drawIdle(t);
+    idleGifRaf=requestAnimationFrame(step);
+  })();
 }
 
 // ─── STATE ───────────────────────────────────────────────────────────────────
@@ -272,17 +345,40 @@ makeDrop('dzAlbum','image/*',false,function(files){
   img.src=URL.createObjectURL(f);
 });
 
-makeDrop('dzBg','image/*',false,function(files){
-  var f=files.find(function(f){return f.type.startsWith('image/');});if(!f)return;
+makeDrop('dzBg','image/*,.gif',false,function(files){
+  var f=files.find(function(f){return f.type.startsWith('image/')||/\.gif$/i.test(f.name);});
+  if(!f)return;
+  var isGif=f.type==='image/gif'||/\.gif$/i.test(f.name);
+
+  // Reset any previous animated-GIF state first
+  if(idleGifRaf){cancelAnimationFrame(idleGifRaf);idleGifRaf=null;}
+  bgIsAnimatedGif=false;bgGifFrames=null;bgGifTotalDuration=0;
+
   var img=new Image();
   img.onload=function(){
     bgImg=img;tilePattern=null; // clear cache
-    document.getElementById('dzBgLabel').textContent='BG image loaded \u2713';
+    document.getElementById('dzBgLabel').textContent=isGif?'GIF background loaded \u2713':'BG image loaded \u2713';
     document.getElementById('dzBg').classList.add('has-file');
     document.getElementById('bgTogRow').style.display='flex';
+    document.getElementById('dzBgHint').textContent='';
     if(bgMode==='color') setBgMode('stretch'); else drawIdle();
   };
   img.src=URL.createObjectURL(f);
+
+  if(isGif){
+    loadGifBackground(f).then(function(ok){
+      if(ok){
+        document.getElementById('dzBgLabel').textContent='Animated GIF background \u2713 ('+bgGifFrames.length+' frames)';
+        document.getElementById('dzBgHint').textContent='Animates live in Preview and is baked into Export, frame-synced.';
+        toast('GIF background loaded \u2014 animates in preview & export');
+        if(bgMode!=='color')startIdleGifLoop();
+        drawIdle();
+      } else {
+        document.getElementById('dzBgHint').textContent='Loaded as a static frame \u2014 this browser can\u2019t decode animated GIFs (try Chrome).';
+        toast('GIF loaded as static image');
+      }
+    });
+  }
 });
 
 makeDrop('dzMusic','audio/*',false,function(files){
@@ -322,30 +418,33 @@ function setMode(m){
 }
 
 // ─── BACKGROUND DRAW ─────────────────────────────────────────────────────────
-function drawBackground(c,cw,ch){
+function drawBackground(c,cw,ch,t){
   // Base color always first
   c.fillStyle=bgColorVal;
   c.fillRect(0,0,cw,ch);
 
-  if(!bgImg||bgMode==='color') return;
+  var img=getCurrentBgImage(t);
+  if(!img||bgMode==='color') return;
 
   if(bgMode==='stretch'){
-    c.drawImage(bgImg,0,0,cw,ch);
+    c.drawImage(img,0,0,cw,ch);
   } else if(bgMode==='tile'){
-    // Build tile pattern at canvas scale
+    // Build tile pattern at canvas scale. For animated GIFs this is rebuilt
+    // every call (frame changes), so no caching here — it's still cheap at
+    // this resolution.
     var tileSize=Math.round(cw*0.25); // tile = 25% of canvas width
     var tc=document.createElement('canvas');
     tc.width=tileSize;tc.height=tileSize;
     var tx=tc.getContext('2d');
-    tx.drawImage(bgImg,0,0,tileSize,tileSize);
+    tx.drawImage(img,0,0,tileSize,tileSize);
     var pat=c.createPattern(tc,'repeat');
     if(pat){c.fillStyle=pat;c.fillRect(0,0,cw,ch);}
   }
 }
 
 // ─── IDLE FRAME ───────────────────────────────────────────────────────────────
-function drawIdle(){
-  drawBackground(ctx,C.width,C.height);
+function drawIdle(t){
+  drawBackground(ctx,C.width,C.height,t||0);
   drawCorners(ctx,C.width,C.height,LOGO_H_PREV*(C.width/PREV_W),ALBUM_W_PREV*(C.width/PREV_W));
   ctx.fillStyle='rgba(212,101,26,0.2)';
   ctx.font='bold 20px Courier New';ctx.textAlign='center';
@@ -473,9 +572,9 @@ function stepSimOnly(freq){
 }
 
 // ─── DRAW ONE FRAME ───────────────────────────────────────────────────────────
-function drawFrame(c,cw,ch,freq,logoH,albumW){
+function drawFrame(c,cw,ch,freq,logoH,albumW,t){
   var sx=cw/FULL_W,sy=ch/FULL_H;
-  drawBackground(c,cw,ch);
+  drawBackground(c,cw,ch,t);
 
   if(currentMode==='A'){
     simSpawnTimer++;
@@ -529,7 +628,7 @@ function previewLoop(){
   while(passFrame<=targetFrame&&passFrame<passTotalFrames){
     var t=passFrame/FPS;var freq=sampleFreq(t);
     if(passFrame===targetFrame||passFrame===passTotalFrames-1){
-      drawFrame(pctx,PREV_W,PREV_H,freq,LOGO_H_PREV,ALBUM_W_PREV);
+      drawFrame(pctx,PREV_W,PREV_H,freq,LOGO_H_PREV,ALBUM_W_PREV,t);
       ctx.drawImage(PC,0,0,C.width,C.height);
     } else {
       stepSimOnly(freq);
@@ -552,6 +651,7 @@ function stopPreview(){
   document.getElementById('infoStage').textContent='Preview done';
   setStatus('Preview done \u2014 happy? Export. Not happy? Preview again.');
   toast('Preview stopped');
+  if(bgIsAnimatedGif)startIdleGifLoop();
 }
 
 // ─── EXPORT ──────────────────────────────────────────────────────────────────
@@ -581,7 +681,7 @@ function exportNextFrame(){
   if(!isExporting)return;
   if(exportFrame>=exportTotal){exportMR.stop();return;}
   var t=exportFrame/FPS;var freq=sampleFreq(t);
-  drawFrame(fctx,FULL_W,FULL_H,freq,LOGO_H_FULL,ALBUM_W_FULL);
+  drawFrame(fctx,FULL_W,FULL_H,freq,LOGO_H_FULL,ALBUM_W_FULL,t);
   if(exportFrame%4===0)ctx.drawImage(FC,0,0,C.width,C.height);
   exportFrame++;
   document.getElementById('pbar').style.width=Math.round(exportFrame/exportTotal*100)+'%';
@@ -598,6 +698,7 @@ function stopExport(){
   document.getElementById('infoStage').textContent='Export stopped';
   setStatus('Export stopped. Preview again or restart export.');
   toast('Export stopped');
+  if(bgIsAnimatedGif)startIdleGifLoop();
 }
 
 function packageZip(){
@@ -617,7 +718,7 @@ function packageZip(){
     'FPS: 24\n'+
     'Spawn Rate: '+spawnRate+'/10\n'+
     'Lifespan: '+lifespanVal+'/10\n'+
-    'Background: '+bgMode+'\n'+
+    'Background: '+bgMode+(bgIsAnimatedGif?' (animated GIF, '+bgGifFrames.length+' frames)':'')+'\n'+
     'Video: abbies-boon-video-'+ts+'.webm\n'+
     (audioFile?'Music: music-'+audioFile.name+'\n':'')+
     '\nTO COMBINE VIDEO + MUSIC:\n'+
@@ -638,6 +739,7 @@ function packageZip(){
     document.getElementById('infoStage').textContent='Done \u2713';
     setStatus('ZIP downloaded \u2713 Video + music inside. Ready to post.');
     toast('ZIP saved \u2713');drawIdle();
+    if(bgIsAnimatedGif)startIdleGifLoop();
   });
 }
 
